@@ -1,0 +1,15 @@
+ext {
+    moduleLibraryName = "PubgChina"
+    magiskModuleId = "software_PubgChina"
+    moduleName = "PubgChina"
+    moduleAuthor = "PubgChina"
+    moduleDescription = "PubgChina"
+    moduleVersion = "3.8.3"
+    moduleVersionCode = 383
+    moduleUrl=""
+    moduleUrlBak=""
+    moduleKey=""
+    moduleUrlBase=""
+    gameVersionCode = "10920"
+}
+

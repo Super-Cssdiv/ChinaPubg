@@ -1,0 +1,221 @@
+#!/sbin/sh
+
+#################
+# Initialization
+#################
+
+umask 022
+
+# Global vars
+TMPDIR=/dev/tmp
+PERSISTDIR=/sbin/.magisk/mirror/persist
+
+rm -rf $TMPDIR 2>/dev/null
+mkdir -p $TMPDIR
+
+# echo before loading util_functions
+ui_print() { echo "$1"; }
+
+require_new_magisk() {
+  ui_print "*******************************"
+  ui_print " 请安装 Magisk v19.0+! "
+  ui_print "*******************************"
+  exit 1
+}
+
+is_legacy_script() {
+  unzip -l "$ZIPFILE" install.sh | grep -q install.sh
+  return $?
+}
+
+copy_sepolicy() {
+  # Remove all existing rule folders
+  rm -rf /data/unencrypted/magisk /cache/magisk /metadata/magisk /persist/magisk /mnt/vendor/persist/magisk
+
+  # Find current active RULESDIR
+  local RULESDIR
+  local ACTIVEDIR=$(magisk --path)/.magisk/mirror/sepolicy.rules
+  if [ -L $ACTIVEDIR ]; then
+    RULESDIR=$(readlink $ACTIVEDIR)
+    [ "${RULESDIR:0:1}" != "/" ] && RULESDIR="$(magisk --path)/.magisk/mirror/$RULESDIR"
+  elif ! $ISENCRYPTED; then
+    RULESDIR=$NVBASE/modules
+  elif [ -d /data/unencrypted ] && ! grep ' /data ' /proc/mounts | grep -qE 'dm-|f2fs'; then
+    RULESDIR=/data/unencrypted/magisk
+  elif grep ' /cache ' /proc/mounts | grep -q 'ext4' ; then
+    RULESDIR=/cache/magisk
+  elif grep ' /metadata ' /proc/mounts | grep -q 'ext4' ; then
+    RULESDIR=/metadata/magisk
+  elif grep ' /persist ' /proc/mounts | grep -q 'ext4' ; then
+    RULESDIR=/persist/magisk
+  elif grep ' /mnt/vendor/persist ' /proc/mounts | grep -q 'ext4' ; then
+    RULESDIR=/mnt/vendor/persist/magisk
+  else
+    ui_print "- 无法找到 sepolicy rules 目录"
+    return 1
+  fi
+
+  if [ -d ${RULESDIR%/magisk} ]; then
+      ui_print "- 安装自定义 sepolicy 规则"
+  else
+    ui_print "- Sepolicy rules 目录: ${RULESDIR%/magisk} not found"
+    return 1
+  fi
+
+  # Copy all enabled sepolicy.rule
+  for r in $NVBASE/modules*/*/sepolicy.rule; do
+    [ -f "$r" ] || continue
+    local MODDIR=${r%/*}
+    [ -f $MODDIR/disable ] && continue
+    [ -f $MODDIR/remove ] && continue
+    local MODNAME=${MODDIR##*/}
+    mkdir -p $RULESDIR/$MODNAME
+    cp -f $r $RULESDIR/$MODNAME/sepolicy.rule
+  done
+}
+
+##############
+# Environment
+##############
+
+OUTFD=$2
+ZIPFILE=$3
+
+mount /data 2>/dev/null
+
+# Load utility functions
+[ -f /data/adb/magisk/util_functions.sh ] || require_new_magisk
+. /data/adb/magisk/util_functions.sh
+[ $MAGISK_VER_CODE -lt 19000 ] && require_new_magisk
+
+# Preperation for flashable zips
+setup_flashable
+
+# Mount partitions
+mount_partitions
+
+# Detect version and architecture
+api_level_arch_detect
+
+# Setup busybox and binaries
+$BOOTMODE && boot_actions || recovery_actions
+
+##############
+# Preparation
+##############
+
+# Extract prop file
+unzip -o "$ZIPFILE" module.prop -d $TMPDIR >&2
+[ ! -f $TMPDIR/module.prop ] && abort "! 无法解压模块 !"
+moduleLibraryName=`grep_prop id $TMPDIR/module.prop`
+MODID=`head -c 4 /dev/urandom | od -A n -t x | tr -d ' '`
+MODNAME=`head -c 5 /dev/urandom | od -A n -t x | tr -d ' '`
+MODVERSION=`grep_prop version $TMPDIR/module.prop`
+MODVERSIONCODE=`grep_prop versionCode $TMPDIR/module.prop`
+MODAUTHOR=`grep_prop author $TMPDIR/module.prop`
+MODDES=`grep_prop description $TMPDIR/module.prop`
+
+echo "id=$MODID" > $TMPDIR/module.prop
+echo "name=$MODNAME" >> $TMPDIR/module.prop
+echo "version=$MODVERSION" >> $TMPDIR/module.prop
+echo "versionCode=$MODVERSIONCODE" >> $TMPDIR/module.prop
+echo "author=$MODAUTHOR" >> $TMPDIR/module.prop
+echo "description=$MODDES" >> $TMPDIR/module.prop
+
+
+$BOOTMODE && MODDIRNAME=modules_update || MODDIRNAME=modules
+MODULEROOT=$NVBASE/$MODDIRNAME
+MODPATH=$MODULEROOT/$MODID
+
+# Create mod paths
+rm -rf $MODPATH 2>/dev/null
+mkdir -p $MODPATH
+
+##########
+# Install
+##########
+
+if is_legacy_script; then
+  unzip -oj "$ZIPFILE" module.prop install.sh uninstall.sh 'common/*' -d $TMPDIR >&2
+
+  # Load install script
+  . $TMPDIR/install.sh
+
+  # Callbacks
+  on_install
+
+  # Custom uninstaller
+  [ -f $TMPDIR/uninstall.sh ] && cp -af $TMPDIR/uninstall.sh $MODPATH/uninstall.sh
+
+  # Skip mount
+  $SKIPMOUNT && touch $MODPATH/skip_mount
+
+  # prop file
+  $PROPFILE && cp -af $TMPDIR/system.prop $MODPATH/system.prop
+
+  # Module info
+  cp -af $TMPDIR/module.prop $MODPATH/module.prop
+
+  # post-fs-data scripts
+  $POSTFSDATA && cp -af $TMPDIR/post-fs-data.sh $MODPATH/post-fs-data.sh
+
+  # service scripts
+  $LATESTARTSERVICE && cp -af $TMPDIR/service.sh $MODPATH/service.sh
+
+  ui_print "- 设置文件权限"
+  set_permissions
+else
+
+  unzip -o "$ZIPFILE" customize.sh -d $MODPATH >&2
+
+  if ! grep -q '^SKIPUNZIP=1$' $MODPATH/customize.sh 2>/dev/null; then
+    ui_print "- 释放模块文件"
+    unzip -o "$ZIPFILE" -x 'META-INF/*' -d $MODPATH >&2
+
+    # Default permissions
+    set_perm_recursive $MODPATH 0 0 0755 0644
+    set_perm_recursive $MODPATH/system/bin 0 2000 0755 0755
+    set_perm_recursive $MODPATH/system/xbin 0 2000 0755 0755
+    set_perm_recursive $MODPATH/system/system_ext/bin 0 2000 0755 0755
+    set_perm_recursive $MODPATH/system/vendor/bin 0 2000 0755 0755 u:object_r:vendor_file:s0
+  fi
+
+  # Load customization script
+  [ -f $MODPATH/customize.sh ] && . $MODPATH/customize.sh
+fi
+
+# Handle replace folders
+for TARGET in $REPLACE; do
+  ui_print "- 替换文件: $TARGET"
+  mktouch $MODPATH$TARGET/.replace
+done
+
+if $BOOTMODE; then
+  # Update info for Magisk Manager
+  mktouch $NVBASE/modules/$MODID/update
+  rm -rf $NVBASE/modules/$MODID/remove 2>/dev/null
+  rm -rf $NVBASE/modules/$MODID/disable 2>/dev/null
+  cp -af $MODPATH/module.prop $NVBASE/modules/$MODID/module.prop
+fi
+
+# Copy over custom sepolicy rules
+if [ -f $MODPATH/sepolicy.rule ]; then
+  copy_sepolicy
+fi
+
+# Remove stuffs that don't belong to modules
+rm -rf \
+$MODPATH/system/placeholder $MODPATH/customize.sh \
+$MODPATH/README.md $MODPATH/.git*
+rmdir -p $MODPATH
+
+##############
+# Finalizing
+##############
+
+cd /
+$BOOTMODE || recovery_cleanup
+rm -rf $TMPDIR
+
+ui_print "- 安装完成，重启手机即可享受愉快的游戏之旅。"
+exit 0
